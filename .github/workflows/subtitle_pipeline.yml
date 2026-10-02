@@ -1,0 +1,102 @@
+name: Build Vietnamese subtitles
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_url:
+        description: Direct URL to a legally accessible audio/video FILE (not a YouTube page URL)
+        required: true
+        type: string
+      episode_id:
+        description: Episode identifier, e.g. EP03
+        required: true
+        default: EP01
+        type: string
+      translation_model:
+        description: Gemini model used for alignment + Vietnamese translation
+        required: true
+        default: gemini-3.8-flash
+        type: string
+
+jobs:
+  subtitle:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ensure ffmpeg is available
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+      - name: Download source media
+        env:
+          MEDIA_URL: ${{ inputs.media_url }}
+        run: |
+          mkdir -p input output
+          curl --fail --location --retry 3 "$MEDIA_URL" --output input/source_media
+
+      - name: Normalize and split into 20-minute WAV chunks
+        run: |
+          ffmpeg -hide_banner -loglevel error -y \
+            -i input/source_media \
+            -vn -ac 1 -ar 16000 \
+            -f segment -segment_time 1200 -reset_timestamps 1 \
+            input/chunk_%03d.wav
+          ls -lh input/chunk_*.wav
+
+      - name: Transcribe, align and translate each chunk
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_TRANSLATION_MODEL: ${{ inputs.translation_model }}
+          EPISODE_ID: ${{ inputs.episode_id }}
+        run: |
+          set -euo pipefail
+          for CHUNK in input/chunk_*.wav; do
+            BASE="$(basename "$CHUNK" .wav)"
+            NUM="${BASE#chunk_}"
+            PART="part${NUM}"
+            ID="${EPISODE_ID}.${PART}"
+
+            python scripts/transcribe.py "$CHUNK" \
+              --episode "$ID" \
+              --out-dir output
+
+            python scripts/translate_to_vi.py \
+              --accuracy "output/${ID}.zh.accuracy.txt" \
+              --timed "output/${ID}.zh.timed.txt" \
+              --out "output/${ID}.vi.srt"
+
+            python scripts/validate_srt.py "output/${ID}.vi.srt"
+          done
+
+      - name: Merge chunks into final episode SRT
+        run: |
+          python scripts/merge_srt.py \
+            --input-dir output \
+            --episode "${{ inputs.episode_id }}" \
+            --chunk-seconds 1200 \
+            --out "output/${{ inputs.episode_id }}.vi.srt"
+          python scripts/validate_srt.py "output/${{ inputs.episode_id }}.vi.srt"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ inputs.episode_id }}-subtitles"
+          path: output/
+          if-no-files-found: error
