@@ -4,23 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       media_url:
-        description: Direct URL to a legally accessible audio/video FILE (not a YouTube page URL)
+        description: "YouTube or direct media URL"
         required: true
         type: string
+
       episode_id:
-        description: Episode identifier, e.g. EP03
+        description: "Episode identifier"
         required: true
-        default: EP01
+        default: "EP01"
         type: string
-      translation_model:
-        description: Gemini model used for alignment + Vietnamese translation
+
+      test_minutes:
+        description: "0 = full episode; otherwise process only first N minutes"
         required: true
-        default: gemini-3.8-flash
+        default: "5"
+        type: string
+
+      translation_model:
+        description: "Gemini model for Vietnamese translation"
+        required: true
+        default: "gemini-3.8-flash"
         type: string
 
 jobs:
   subtitle:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
 
@@ -31,11 +40,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --upgrade yt-dlp
 
       - name: Ensure ffmpeg is available
         run: |
@@ -44,29 +56,60 @@ jobs:
             sudo apt-get install -y ffmpeg
           fi
 
-      - name: Download source media
+      - name: Download source audio
         env:
           MEDIA_URL: ${{ inputs.media_url }}
         run: |
           mkdir -p input output
-          curl --fail --location --retry 3 "$MEDIA_URL" --output input/source_media
 
-      - name: Normalize and split into 20-minute WAV chunks
+          yt-dlp \
+            --no-playlist \
+            --format "bestaudio/best" \
+            --extract-audio \
+            --audio-format wav \
+            --audio-quality 0 \
+            --output "input/source_audio.%(ext)s" \
+            "$MEDIA_URL"
+
+          ls -lh input/
+
+      - name: Normalize and split audio
+        env:
+          TEST_MINUTES: ${{ inputs.test_minutes }}
         run: |
-          ffmpeg -hide_banner -loglevel error -y \
-            -i input/source_media \
-            -vn -ac 1 -ar 16000 \
-            -f segment -segment_time 1200 -reset_timestamps 1 \
-            input/chunk_%03d.wav
+          set -euo pipefail
+
+          if [ "$TEST_MINUTES" = "0" ]; then
+            ffmpeg -hide_banner -loglevel error -y \
+              -i input/source_audio.wav \
+              -vn -ac 1 -ar 16000 \
+              -f segment \
+              -segment_time 1200 \
+              -reset_timestamps 1 \
+              input/chunk_%03d.wav
+          else
+            SECONDS=$((TEST_MINUTES * 60))
+
+            ffmpeg -hide_banner -loglevel error -y \
+              -i input/source_audio.wav \
+              -t "$SECONDS" \
+              -vn -ac 1 -ar 16000 \
+              -f segment \
+              -segment_time 1200 \
+              -reset_timestamps 1 \
+              input/chunk_%03d.wav
+          fi
+
           ls -lh input/chunk_*.wav
 
-      - name: Transcribe, align and translate each chunk
+      - name: Transcribe and translate
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_TRANSLATION_MODEL: ${{ inputs.translation_model }}
           EPISODE_ID: ${{ inputs.episode_id }}
         run: |
           set -euo pipefail
+
           for CHUNK in input/chunk_*.wav; do
             BASE="$(basename "$CHUNK" .wav)"
             NUM="${BASE#chunk_}"
@@ -82,19 +125,22 @@ jobs:
               --timed "output/${ID}.zh.timed.txt" \
               --out "output/${ID}.vi.srt"
 
-            python scripts/validate_srt.py "output/${ID}.vi.srt"
+            python scripts/validate_srt.py \
+              "output/${ID}.vi.srt"
           done
 
-      - name: Merge chunks into final episode SRT
+      - name: Merge chunks
         run: |
           python scripts/merge_srt.py \
             --input-dir output \
             --episode "${{ inputs.episode_id }}" \
             --chunk-seconds 1200 \
             --out "output/${{ inputs.episode_id }}.vi.srt"
-          python scripts/validate_srt.py "output/${{ inputs.episode_id }}.vi.srt"
 
-      - name: Upload results
+          python scripts/validate_srt.py \
+            "output/${{ inputs.episode_id }}.vi.srt"
+
+      - name: Upload subtitle files
         uses: actions/upload-artifact@v4
         with:
           name: "${{ inputs.episode_id }}-subtitles"
